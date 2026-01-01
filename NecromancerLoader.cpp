@@ -47,6 +47,7 @@ struct MANUAL_MAP_DATA {
 bool CheckAVX2Support();
 DWORD GetProcessId(const wchar_t* processName);
 bool IsProcessRunning(const wchar_t* processName);
+int GetProcessUptime(DWORD pid);
 std::vector<BYTE> DownloadFile(const char* url);
 std::vector<BYTE> ExtractDllFromZip(const std::vector<BYTE>& zipData);
 bool ManualMap(HANDLE hProcess, const std::vector<BYTE>& dllData);
@@ -199,6 +200,30 @@ DWORD GetProcessId(const wchar_t* processName) {
 // Check if process is running
 bool IsProcessRunning(const wchar_t* processName) {
     return GetProcessId(processName) != 0;
+}
+
+// Get process uptime in seconds
+int GetProcessUptime(DWORD pid) {
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProcess) return -1;
+
+    FILETIME createTime, exitTime, kernelTime, userTime;
+    if (!GetProcessTimes(hProcess, &createTime, &exitTime, &kernelTime, &userTime)) {
+        CloseHandle(hProcess);
+        return -1;
+    }
+    CloseHandle(hProcess);
+
+    FILETIME nowTime;
+    GetSystemTimeAsFileTime(&nowTime);
+
+    ULARGE_INTEGER create, now;
+    create.LowPart = createTime.dwLowDateTime;
+    create.HighPart = createTime.dwHighDateTime;
+    now.LowPart = nowTime.dwLowDateTime;
+    now.HighPart = nowTime.dwHighDateTime;
+
+    return static_cast<int>((now.QuadPart - create.QuadPart) / 10000000ULL);
 }
 
 // Download file from URL
@@ -640,17 +665,23 @@ int main() {
         std::cout << "[*] Please start TF2 and wait until you're in the main menu.\n";
         Color::White();
         WaitForProcess(L"tf_win64.exe", "Team Fortress 2");
-        
-        // Give the game time to fully initialize
-        Color::Cyan();
-        std::cout << "[*] Waiting for game to initialize...\n";
-        Color::White();
-        std::this_thread::sleep_for(std::chrono::seconds(5));
     }
     else {
         Color::Green();
         std::cout << "[+] Team Fortress 2 is running\n";
         Color::White();
+    }
+
+    // Wait for TF2 to be open for at least 25 seconds
+    DWORD tf2Pid = GetProcessId(L"tf_win64.exe");
+    int uptime = GetProcessUptime(tf2Pid);
+    if (uptime >= 0 && uptime < 25) {
+        int waitTime = 25 - uptime;
+        Color::Cyan();
+        std::cout << "[*] TF2 has been running for " << uptime << " seconds\n";
+        std::cout << "[*] Waiting " << waitTime << " more seconds for game to initialize...\n";
+        Color::White();
+        std::this_thread::sleep_for(std::chrono::seconds(waitTime));
     }
 
     std::cout << "\n";
@@ -738,6 +769,11 @@ int main() {
         std::cout << "\n[+] Injection successful!\n";
         std::cout << "[+] Necromancer has been loaded.\n\n";
         Color::White();
+        CloseHandle(hProcess);
+        
+        std::cout << "Closing in 5 seconds...";
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        return 0;
     }
     else {
         Color::Red();
