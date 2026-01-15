@@ -1,3 +1,18 @@
+/*
+ * Necromancer Loader v2.1
+ * Uses GH Injector Library for reliable manual map injection
+ * Single EXE with embedded DLL
+ * 
+ * Flow:
+ * 1. User double-clicks exe
+ * 2. Auto-elevates to admin
+ * 3. Extracts embedded GH Injector DLL to C:\necromancer_tf2
+ * 4. Downloads cheat DLL from nightly build
+ * 5. Waits for TF2
+ * 6. Uses GH Injector Library for manual map injection
+ * 7. Closes after 5 seconds
+ */
+
 #define WIN32_LEAN_AND_MEAN
 #define _CRT_SECURE_NO_WARNINGS
 
@@ -13,35 +28,96 @@
 #include <fstream>
 #include <thread>
 #include <chrono>
+#include <Psapi.h>
+#include <shellapi.h>
 
+// GH Injector Library header
+#include "Injection.h"
+#include "resource.h"
+
+#pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "wininet.lib")
+#pragma comment(lib, "Psapi.lib")
+
+// Necromancer directory for all files
+const wchar_t* NECROMANCER_DIR = L"C:\\necromancer_tf2\\loader";
+const wchar_t* GH_INJECTOR_DLL_NAME = L"GH Injector - x64.dll";
 
 // Console colors
 namespace Color {
-    void Red() { SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), FOREGROUND_RED | FOREGROUND_INTENSITY); }
-    void Green() { SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), FOREGROUND_GREEN | FOREGROUND_INTENSITY); }
-    void Yellow() { SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY); }
-    void Cyan() { SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY); }
-    void White() { SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE); }
-    void Magenta() { SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), FOREGROUND_RED | FOREGROUND_BLUE | FOREGROUND_INTENSITY); }
+    void Set(int color) { SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), color); }
+    void Red() { Set(FOREGROUND_RED | FOREGROUND_INTENSITY); }
+    void Green() { Set(FOREGROUND_GREEN | FOREGROUND_INTENSITY); }
+    void Yellow() { Set(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY); }
+    void Cyan() { Set(FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY); }
+    void White() { Set(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE); }
+    void Gray() { Set(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE); }
+    void Magenta() { Set(FOREGROUND_RED | FOREGROUND_BLUE | FOREGROUND_INTENSITY); }
+    void DarkGray() { Set(FOREGROUND_INTENSITY); }
+}
+
+// Print status with icon
+void PrintStatus(const char* icon, const char* msg, void(*color)() = Color::White) {
+    Color::DarkGray();
+    std::cout << "  " << icon << " ";
+    color();
+    std::cout << msg << "\n";
+    Color::White();
+}
+
+void PrintOK(const char* msg) { PrintStatus("\xFB", msg, Color::Green); }      // checkmark
+void PrintInfo(const char* msg) { PrintStatus("\xF9", msg, Color::Cyan); }     // bullet
+void PrintWarn(const char* msg) { PrintStatus("!", msg, Color::Yellow); }
+void PrintErr(const char* msg) { PrintStatus("X", msg, Color::Red); }
+
+void PrintProgress(int percent) {
+    Color::DarkGray();
+    std::cout << "\r  [";
+    Color::Cyan();
+    int filled = percent / 5;
+    for (int i = 0; i < 20; i++) {
+        if (i < filled) std::cout << "\xDB";
+        else std::cout << "\xB0";
+    }
+    Color::DarkGray();
+    std::cout << "] ";
+    Color::White();
+    std::cout << percent << "%  " << std::flush;
+}
+
+// Check if running as administrator
+bool IsRunningAsAdmin() {
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    
+    if (AllocateAndInitializeSid(&ntAuthority, 2, SECURITY_BUILTIN_DOMAIN_RID,
+        DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminGroup)) {
+        CheckTokenMembership(NULL, adminGroup, &isAdmin);
+        FreeSid(adminGroup);
+    }
+    return isAdmin;
 }
 
 // URLs
 const char* URL_RELEASE = "https://nightly.link/asdasfxcvxcvcb/necromancer/workflows/nightly/main/necromancer-Release-x64.zip";
 const char* URL_AVX2 = "https://nightly.link/asdasfxcvxcvcb/necromancer/workflows/nightly/main/necromancer-ReleaseAVX2-x64.zip";
 const wchar_t* PROCESS_NAME = L"tf_win64.exe";
-const wchar_t* STEAM_PROCESS = L"steam.exe";
 
-// Manual Map structures
-struct MANUAL_MAP_DATA {
-    LPVOID pLoadLibraryA;
-    LPVOID pGetProcAddress;
-    LPVOID pRtlAddFunctionTable;
-    LPVOID pbase;
-    HINSTANCE hModule;
-    DWORD fdwReason;
-    LPVOID reserved;
-};
+// GH Injector function types
+using f_InjectW = DWORD(__stdcall*)(INJECTIONDATAW* pData);
+using f_GetSymbolState = DWORD(__stdcall*)();
+using f_GetImportState = DWORD(__stdcall*)();
+using f_StartDownload = void(__stdcall*)();
+using f_GetDownloadProgressEx = float(__stdcall*)(int index, bool bWow64);
+
+// Global GH Injector handles
+HINSTANCE g_hInjectorDll = nullptr;
+f_InjectW g_pInjectW = nullptr;
+f_GetSymbolState g_pGetSymbolState = nullptr;
+f_GetImportState g_pGetImportState = nullptr;
+f_StartDownload g_pStartDownload = nullptr;
+f_GetDownloadProgressEx g_pGetDownloadProgressEx = nullptr;
 
 // Function prototypes
 bool CheckAVX2Support();
@@ -50,119 +126,54 @@ bool IsProcessRunning(const wchar_t* processName);
 int GetProcessUptime(DWORD pid);
 std::vector<BYTE> DownloadFile(const char* url);
 std::vector<BYTE> ExtractDllFromZip(const std::vector<BYTE>& zipData);
-bool ManualMap(HANDLE hProcess, const std::vector<BYTE>& dllData);
+bool SaveDllToTemp(const std::vector<BYTE>& dllData, std::wstring& outPath);
+bool ExtractEmbeddedDll(std::wstring& outPath);
+bool LoadGHInjector();
+void UnloadGHInjector();
+bool WaitForGHInjectorReady();
+bool InjectWithGHInjector(DWORD pid, const std::wstring& dllPath);
 void PrintBanner();
 void WaitForProcess(const wchar_t* processName, const char* displayName);
 
-
-// Shellcode for manual mapping - runs in target process
-void Shellcode(MANUAL_MAP_DATA* pData) {
-    if (!pData) return;
-
-    BYTE* pBase = reinterpret_cast<BYTE*>(pData->pbase);
-    auto* pOptHeader = &reinterpret_cast<IMAGE_NT_HEADERS*>(pBase + reinterpret_cast<IMAGE_DOS_HEADER*>(pBase)->e_lfanew)->OptionalHeader;
-
-    auto pLoadLibraryA = reinterpret_cast<decltype(&LoadLibraryA)>(pData->pLoadLibraryA);
-    auto pGetProcAddress = reinterpret_cast<decltype(&GetProcAddress)>(pData->pGetProcAddress);
-    auto pRtlAddFunctionTable = reinterpret_cast<decltype(&RtlAddFunctionTable)>(pData->pRtlAddFunctionTable);
-
-    // Process relocations
-    auto deltaBase = reinterpret_cast<UINT_PTR>(pBase - pOptHeader->ImageBase);
-    if (deltaBase) {
-        if (!pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size) return;
-
-        auto* pRelocData = reinterpret_cast<IMAGE_BASE_RELOCATION*>(pBase + pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
-        while (pRelocData->VirtualAddress) {
-            UINT numEntries = (pRelocData->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
-            WORD* pRelativeInfo = reinterpret_cast<WORD*>(pRelocData + 1);
-
-            for (UINT i = 0; i < numEntries; ++i, ++pRelativeInfo) {
-                if ((*pRelativeInfo >> 12) == IMAGE_REL_BASED_DIR64) {
-                    UINT_PTR* pPatch = reinterpret_cast<UINT_PTR*>(pBase + pRelocData->VirtualAddress + (*pRelativeInfo & 0xFFF));
-                    *pPatch += deltaBase;
-                }
-                else if ((*pRelativeInfo >> 12) == IMAGE_REL_BASED_HIGHLOW) {
-                    DWORD* pPatch = reinterpret_cast<DWORD*>(pBase + pRelocData->VirtualAddress + (*pRelativeInfo & 0xFFF));
-                    *pPatch += static_cast<DWORD>(deltaBase);
-                }
-            }
-            pRelocData = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<BYTE*>(pRelocData) + pRelocData->SizeOfBlock);
+// Extract embedded GH Injector DLL from resources
+bool ExtractEmbeddedDll(std::wstring& outPath) {
+    std::error_code ec;
+    std::filesystem::create_directories(NECROMANCER_DIR, ec);
+    
+    std::wstring x64Dir = std::wstring(NECROMANCER_DIR) + L"\\x64";
+    std::wstring x86Dir = std::wstring(NECROMANCER_DIR) + L"\\x86";
+    std::filesystem::create_directories(x64Dir, ec);
+    std::filesystem::create_directories(x86Dir, ec);
+    
+    outPath = std::wstring(NECROMANCER_DIR) + L"\\" + GH_INJECTOR_DLL_NAME;
+    
+    if (std::filesystem::exists(outPath)) {
+        HMODULE hTest = LoadLibraryExW(outPath.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES);
+        if (hTest) {
+            FreeLibrary(hTest);
+            return true;
         }
+        std::filesystem::remove(outPath, ec);
     }
-
-    // Process imports
-    if (pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size) {
-        auto* pImportDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(pBase + pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
-        while (pImportDesc->Name) {
-            char* szModule = reinterpret_cast<char*>(pBase + pImportDesc->Name);
-            HINSTANCE hDll = pLoadLibraryA(szModule);
-
-            ULONG_PTR* pThunkRef = reinterpret_cast<ULONG_PTR*>(pBase + pImportDesc->OriginalFirstThunk);
-            ULONG_PTR* pFuncRef = reinterpret_cast<ULONG_PTR*>(pBase + pImportDesc->FirstThunk);
-
-            if (!pThunkRef) pThunkRef = pFuncRef;
-
-            for (; *pThunkRef; ++pThunkRef, ++pFuncRef) {
-                if (IMAGE_SNAP_BY_ORDINAL(*pThunkRef)) {
-                    *pFuncRef = reinterpret_cast<ULONG_PTR>(pGetProcAddress(hDll, reinterpret_cast<char*>(*pThunkRef & 0xFFFF)));
-                }
-                else {
-                    auto* pImport = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(pBase + *pThunkRef);
-                    *pFuncRef = reinterpret_cast<ULONG_PTR>(pGetProcAddress(hDll, pImport->Name));
-                }
-            }
-            ++pImportDesc;
-        }
-    }
-
-    // Process delayed imports
-    if (pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].Size) {
-        auto* pDelayImport = reinterpret_cast<IMAGE_DELAYLOAD_DESCRIPTOR*>(pBase + pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress);
-        while (pDelayImport->DllNameRVA) {
-            char* szModule = reinterpret_cast<char*>(pBase + pDelayImport->DllNameRVA);
-            HINSTANCE hDll = pLoadLibraryA(szModule);
-
-            if (hDll) {
-                ULONG_PTR* pThunkRef = reinterpret_cast<ULONG_PTR*>(pBase + pDelayImport->ImportNameTableRVA);
-                ULONG_PTR* pFuncRef = reinterpret_cast<ULONG_PTR*>(pBase + pDelayImport->ImportAddressTableRVA);
-
-                for (; *pThunkRef; ++pThunkRef, ++pFuncRef) {
-                    if (IMAGE_SNAP_BY_ORDINAL(*pThunkRef)) {
-                        *pFuncRef = reinterpret_cast<ULONG_PTR>(pGetProcAddress(hDll, reinterpret_cast<char*>(*pThunkRef & 0xFFFF)));
-                    }
-                    else {
-                        auto* pImport = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(pBase + *pThunkRef);
-                        *pFuncRef = reinterpret_cast<ULONG_PTR>(pGetProcAddress(hDll, pImport->Name));
-                    }
-                }
-            }
-            ++pDelayImport;
-        }
-    }
-
-    // TLS callbacks
-    if (pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size) {
-        auto* pTLS = reinterpret_cast<IMAGE_TLS_DIRECTORY*>(pBase + pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
-        auto* pCallback = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(pTLS->AddressOfCallBacks);
-        while (pCallback && *pCallback) {
-            (*pCallback)(reinterpret_cast<PVOID>(pBase), DLL_PROCESS_ATTACH, nullptr);
-            ++pCallback;
-        }
-    }
-
-    // Exception handling
-    if (pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size) {
-        auto* pExceptionDir = reinterpret_cast<IMAGE_RUNTIME_FUNCTION_ENTRY*>(pBase + pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress);
-        DWORD numEntries = pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY);
-        pRtlAddFunctionTable(pExceptionDir, numEntries, reinterpret_cast<DWORD64>(pBase));
-    }
-
-    // Call DllMain
-    auto pDllMain = reinterpret_cast<BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID)>(pBase + pOptHeader->AddressOfEntryPoint);
-    pData->hModule = reinterpret_cast<HINSTANCE>(pBase);
-    pDllMain(reinterpret_cast<HINSTANCE>(pBase), DLL_PROCESS_ATTACH, nullptr);
+    
+    HRSRC hRes = FindResourceW(nullptr, MAKEINTRESOURCEW(IDR_GH_INJECTOR_DLL), RT_RCDATA);
+    if (!hRes) return false;
+    
+    HGLOBAL hResData = LoadResource(nullptr, hRes);
+    if (!hResData) return false;
+    
+    void* pData = LockResource(hResData);
+    DWORD dataSize = SizeofResource(nullptr, hRes);
+    if (!pData || dataSize == 0) return false;
+    
+    std::ofstream file(outPath, std::ios::binary);
+    if (!file) return false;
+    
+    file.write(static_cast<const char*>(pData), dataSize);
+    file.close();
+    
+    return true;
 }
-
 
 // Check if CPU supports AVX2
 bool CheckAVX2Support() {
@@ -172,7 +183,7 @@ bool CheckAVX2Support() {
 
     if (nIds >= 7) {
         __cpuidex(cpuInfo, 7, 0);
-        return (cpuInfo[1] & (1 << 5)) != 0; // AVX2 bit
+        return (cpuInfo[1] & (1 << 5)) != 0;
     }
     return false;
 }
@@ -230,7 +241,7 @@ int GetProcessUptime(DWORD pid) {
 std::vector<BYTE> DownloadFile(const char* url) {
     std::vector<BYTE> data;
 
-    HINTERNET hInternet = InternetOpenA("NecromancerLoader/1.0", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+    HINTERNET hInternet = InternetOpenA("NecromancerLoader/2.0", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
     if (!hInternet) return data;
 
     HINTERNET hUrl = InternetOpenUrlA(hInternet, url, nullptr, 0, 
@@ -252,538 +263,417 @@ std::vector<BYTE> DownloadFile(const char* url) {
     return data;
 }
 
-// Simple ZIP extraction - finds and extracts the DLL from the zip
+// Extract DLL from ZIP archive
 std::vector<BYTE> ExtractDllFromZip(const std::vector<BYTE>& zipData) {
     std::vector<BYTE> dllData;
     
     if (zipData.size() < 30) return dllData;
 
-    // ZIP local file header signature: 0x04034b50
-    size_t pos = 0;
-    while (pos + 30 <= zipData.size()) {
-        if (zipData[pos] == 0x50 && zipData[pos + 1] == 0x4B && 
-            zipData[pos + 2] == 0x03 && zipData[pos + 3] == 0x04) {
-            
-            WORD compressionMethod = *reinterpret_cast<const WORD*>(&zipData[pos + 8]);
-            DWORD compressedSize = *reinterpret_cast<const DWORD*>(&zipData[pos + 18]);
-            DWORD uncompressedSize = *reinterpret_cast<const DWORD*>(&zipData[pos + 22]);
-            WORD fileNameLen = *reinterpret_cast<const WORD*>(&zipData[pos + 26]);
-            WORD extraFieldLen = *reinterpret_cast<const WORD*>(&zipData[pos + 28]);
-
-            if (pos + 30 + fileNameLen > zipData.size()) break;
-
-            std::string fileName(reinterpret_cast<const char*>(&zipData[pos + 30]), fileNameLen);
-            
-            // Check if it's a DLL file
-            if (fileName.size() >= 4 && 
-                (fileName.substr(fileName.size() - 4) == ".dll" || fileName.substr(fileName.size() - 4) == ".DLL")) {
-                
-                size_t dataStart = pos + 30 + fileNameLen + extraFieldLen;
-                
-                if (compressionMethod == 0) { // Stored (no compression)
-                    if (dataStart + uncompressedSize <= zipData.size()) {
-                        dllData.assign(zipData.begin() + dataStart, zipData.begin() + dataStart + uncompressedSize);
-                        return dllData;
-                    }
-                }
-                else if (compressionMethod == 8) { // Deflate
-                    // For deflate, we need to decompress
-                    // Using Windows built-in decompression
-                    if (dataStart + compressedSize <= zipData.size()) {
-                        // Allocate buffer for decompressed data
-                        dllData.resize(uncompressedSize);
-                        
-                        // Use RtlDecompressBuffer
-                        typedef NTSTATUS(WINAPI* RtlDecompressBufferFn)(
-                            USHORT CompressionFormat,
-                            PUCHAR UncompressedBuffer,
-                            ULONG UncompressedBufferSize,
-                            PUCHAR CompressedBuffer,
-                            ULONG CompressedBufferSize,
-                            PULONG FinalUncompressedSize
-                        );
-                        
-                        // Deflate in ZIP needs manual handling - let's use a simpler approach
-                        // Save to temp file and use shell to extract
-                        std::filesystem::path tempDir = std::filesystem::temp_directory_path();
-                        std::filesystem::path zipPath = tempDir / "necromancer_temp.zip";
-                        std::filesystem::path extractDir = tempDir / "necromancer_extract";
-                        
-                        // Write zip to temp file
-                        std::ofstream zipFile(zipPath, std::ios::binary);
-                        zipFile.write(reinterpret_cast<const char*>(zipData.data()), zipData.size());
-                        zipFile.close();
-                        
-                        // Create extract directory
-                        std::filesystem::create_directories(extractDir);
-                        
-                        // Use PowerShell to extract
-                        std::wstring cmd = L"powershell -NoProfile -Command \"Expand-Archive -Path '";
-                        cmd += zipPath.wstring();
-                        cmd += L"' -DestinationPath '";
-                        cmd += extractDir.wstring();
-                        cmd += L"' -Force\"";
-                        
-                        STARTUPINFOW si = { sizeof(si) };
-                        si.dwFlags = STARTF_USESHOWWINDOW;
-                        si.wShowWindow = SW_HIDE;
-                        PROCESS_INFORMATION pi;
-                        
-                        if (CreateProcessW(nullptr, const_cast<LPWSTR>(cmd.c_str()), nullptr, nullptr, FALSE, 
-                            CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-                            WaitForSingleObject(pi.hProcess, 30000);
-                            CloseHandle(pi.hProcess);
-                            CloseHandle(pi.hThread);
-                        }
-                        
-                        // Find the DLL in extracted files
-                        for (const auto& entry : std::filesystem::recursive_directory_iterator(extractDir)) {
-                            if (entry.is_regular_file() && entry.path().extension() == L".dll") {
-                                std::ifstream dllFile(entry.path(), std::ios::binary | std::ios::ate);
-                                if (dllFile) {
-                                    size_t size = dllFile.tellg();
-                                    dllFile.seekg(0);
-                                    dllData.resize(size);
-                                    dllFile.read(reinterpret_cast<char*>(dllData.data()), size);
-                                    dllFile.close();
-                                }
-                                break;
-                            }
-                        }
-                        
-                        // Cleanup
-                        std::error_code ec;
-                        std::filesystem::remove(zipPath, ec);
-                        std::filesystem::remove_all(extractDir, ec);
-                        
-                        return dllData;
-                    }
-                }
+    // Use PowerShell for reliable extraction
+    std::filesystem::path tempDir = std::filesystem::temp_directory_path();
+    std::filesystem::path zipPath = tempDir / "necromancer_temp.zip";
+    std::filesystem::path extractDir = tempDir / "necromancer_extract";
+    
+    // Clean up any previous extraction
+    std::error_code ec;
+    std::filesystem::remove(zipPath, ec);
+    std::filesystem::remove_all(extractDir, ec);
+    
+    // Write zip to temp file
+    std::ofstream zipFile(zipPath, std::ios::binary);
+    if (!zipFile) return dllData;
+    zipFile.write(reinterpret_cast<const char*>(zipData.data()), zipData.size());
+    zipFile.close();
+    
+    // Create extract directory
+    std::filesystem::create_directories(extractDir);
+    
+    // Use PowerShell to extract
+    std::wstring cmd = L"powershell -NoProfile -Command \"Expand-Archive -Path '";
+    cmd += zipPath.wstring();
+    cmd += L"' -DestinationPath '";
+    cmd += extractDir.wstring();
+    cmd += L"' -Force\"";
+    
+    STARTUPINFOW si = { sizeof(si) };
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi;
+    
+    if (CreateProcessW(nullptr, const_cast<LPWSTR>(cmd.c_str()), nullptr, nullptr, FALSE, 
+        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 30000);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    
+    // Find the DLL in extracted files
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(extractDir)) {
+        if (entry.is_regular_file() && entry.path().extension() == L".dll") {
+            std::ifstream dllFile(entry.path(), std::ios::binary | std::ios::ate);
+            if (dllFile) {
+                size_t size = dllFile.tellg();
+                dllFile.seekg(0);
+                dllData.resize(size);
+                dllFile.read(reinterpret_cast<char*>(dllData.data()), size);
+                dllFile.close();
             }
-            
-            // Move to next file
-            pos += 30 + fileNameLen + extraFieldLen + compressedSize;
-        }
-        else {
-            pos++;
+            break;
         }
     }
+    
+    // Cleanup
+    std::filesystem::remove(zipPath, ec);
+    std::filesystem::remove_all(extractDir, ec);
     
     return dllData;
 }
 
-
-// Manual Map injection
-bool ManualMap(HANDLE hProcess, const std::vector<BYTE>& dllData) {
-    if (dllData.size() < sizeof(IMAGE_DOS_HEADER)) {
-        Color::Red();
-        std::cout << "[!] Invalid DLL data - too small\n";
-        Color::White();
-        return false;
-    }
-
-    auto* pDosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(dllData.data());
-    if (pDosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
-        Color::Red();
-        std::cout << "[!] Invalid DOS signature\n";
-        Color::White();
-        return false;
-    }
-
-    if (dllData.size() < pDosHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS)) {
-        Color::Red();
-        std::cout << "[!] Invalid DLL data - NT headers out of bounds\n";
-        Color::White();
-        return false;
-    }
-
-    auto* pNtHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(dllData.data() + pDosHeader->e_lfanew);
-    if (pNtHeaders->Signature != IMAGE_NT_SIGNATURE) {
-        Color::Red();
-        std::cout << "[!] Invalid NT signature\n";
-        Color::White();
-        return false;
-    }
-
-    if (pNtHeaders->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
-        Color::Red();
-        std::cout << "[!] DLL is not 64-bit\n";
-        Color::White();
-        return false;
-    }
-
-    const auto& optHeader = pNtHeaders->OptionalHeader;
+// Save DLL to necromancer directory
+bool SaveDllToTemp(const std::vector<BYTE>& dllData, std::wstring& outPath) {
+    std::wstring dllPath = std::wstring(NECROMANCER_DIR) + L"\\necromancer.dll";
     
-    // Allocate memory in target process
-    LPVOID pTargetBase = VirtualAllocEx(hProcess, nullptr, optHeader.SizeOfImage, 
-        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    std::ofstream file(dllPath, std::ios::binary);
+    if (!file) return false;
     
-    if (!pTargetBase) {
-        Color::Red();
-        std::cout << "[!] Failed to allocate memory in target process: " << GetLastError() << "\n";
-        Color::White();
-        return false;
-    }
-
-    Color::Cyan();
-    std::cout << "[*] Allocated " << optHeader.SizeOfImage << " bytes at 0x" << std::hex << pTargetBase << std::dec << "\n";
-    Color::White();
-
-    // Write headers
-    if (!WriteProcessMemory(hProcess, pTargetBase, dllData.data(), optHeader.SizeOfHeaders, nullptr)) {
-        Color::Red();
-        std::cout << "[!] Failed to write headers\n";
-        Color::White();
-        VirtualFreeEx(hProcess, pTargetBase, 0, MEM_RELEASE);
-        return false;
-    }
-
-    // Write sections
-    auto* pSectionHeader = IMAGE_FIRST_SECTION(pNtHeaders);
-    for (WORD i = 0; i < pNtHeaders->FileHeader.NumberOfSections; ++i, ++pSectionHeader) {
-        if (pSectionHeader->SizeOfRawData == 0) continue;
-
-        if (pSectionHeader->PointerToRawData + pSectionHeader->SizeOfRawData > dllData.size()) {
-            Color::Yellow();
-            std::cout << "[!] Section " << i << " data out of bounds, skipping\n";
-            Color::White();
-            continue;
-        }
-
-        LPVOID pSectionDest = reinterpret_cast<BYTE*>(pTargetBase) + pSectionHeader->VirtualAddress;
-        if (!WriteProcessMemory(hProcess, pSectionDest, 
-            dllData.data() + pSectionHeader->PointerToRawData, 
-            pSectionHeader->SizeOfRawData, nullptr)) {
-            Color::Red();
-            std::cout << "[!] Failed to write section " << i << "\n";
-            Color::White();
-            VirtualFreeEx(hProcess, pTargetBase, 0, MEM_RELEASE);
-            return false;
-        }
-    }
-
-    Color::Cyan();
-    std::cout << "[*] Sections mapped successfully\n";
-    Color::White();
-
-    // Prepare manual map data
-    MANUAL_MAP_DATA mapData = { 0 };
-    HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
-    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
-
-    mapData.pLoadLibraryA = GetProcAddress(hKernel32, "LoadLibraryA");
-    mapData.pGetProcAddress = GetProcAddress(hKernel32, "GetProcAddress");
-    mapData.pRtlAddFunctionTable = GetProcAddress(hNtdll, "RtlAddFunctionTable");
-    mapData.pbase = pTargetBase;
-    mapData.fdwReason = DLL_PROCESS_ATTACH;
-    mapData.reserved = nullptr;
-
-    // Allocate memory for map data
-    LPVOID pMapData = VirtualAllocEx(hProcess, nullptr, sizeof(MANUAL_MAP_DATA), 
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    file.write(reinterpret_cast<const char*>(dllData.data()), dllData.size());
+    file.close();
     
-    if (!pMapData) {
-        Color::Red();
-        std::cout << "[!] Failed to allocate map data memory\n";
-        Color::White();
-        VirtualFreeEx(hProcess, pTargetBase, 0, MEM_RELEASE);
-        return false;
-    }
-
-    if (!WriteProcessMemory(hProcess, pMapData, &mapData, sizeof(mapData), nullptr)) {
-        Color::Red();
-        std::cout << "[!] Failed to write map data\n";
-        Color::White();
-        VirtualFreeEx(hProcess, pTargetBase, 0, MEM_RELEASE);
-        VirtualFreeEx(hProcess, pMapData, 0, MEM_RELEASE);
-        return false;
-    }
-
-    // Allocate and write shellcode
-    void* pShellcode = VirtualAllocEx(hProcess, nullptr, 0x1000, 
-        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    
-    if (!pShellcode) {
-        Color::Red();
-        std::cout << "[!] Failed to allocate shellcode memory\n";
-        Color::White();
-        VirtualFreeEx(hProcess, pTargetBase, 0, MEM_RELEASE);
-        VirtualFreeEx(hProcess, pMapData, 0, MEM_RELEASE);
-        return false;
-    }
-
-    if (!WriteProcessMemory(hProcess, pShellcode, Shellcode, 0x1000, nullptr)) {
-        Color::Red();
-        std::cout << "[!] Failed to write shellcode\n";
-        Color::White();
-        VirtualFreeEx(hProcess, pTargetBase, 0, MEM_RELEASE);
-        VirtualFreeEx(hProcess, pMapData, 0, MEM_RELEASE);
-        VirtualFreeEx(hProcess, pShellcode, 0, MEM_RELEASE);
-        return false;
-    }
-
-    Color::Cyan();
-    std::cout << "[*] Shellcode written, creating remote thread...\n";
-    Color::White();
-
-    // Execute shellcode
-    HANDLE hThread = CreateRemoteThread(hProcess, nullptr, 0, 
-        reinterpret_cast<LPTHREAD_START_ROUTINE>(pShellcode), pMapData, 0, nullptr);
-    
-    if (!hThread) {
-        Color::Red();
-        std::cout << "[!] Failed to create remote thread: " << GetLastError() << "\n";
-        Color::White();
-        VirtualFreeEx(hProcess, pTargetBase, 0, MEM_RELEASE);
-        VirtualFreeEx(hProcess, pMapData, 0, MEM_RELEASE);
-        VirtualFreeEx(hProcess, pShellcode, 0, MEM_RELEASE);
-        return false;
-    }
-
-    // Wait for shellcode to complete
-    DWORD waitResult = WaitForSingleObject(hThread, 15000);
-    
-    if (waitResult == WAIT_TIMEOUT) {
-        Color::Yellow();
-        std::cout << "[!] Shellcode execution timed out (may still be running)\n";
-        Color::White();
-    }
-    else if (waitResult == WAIT_FAILED) {
-        Color::Red();
-        std::cout << "[!] Wait failed: " << GetLastError() << "\n";
-        Color::White();
-    }
-
-    CloseHandle(hThread);
-
-    // Cleanup shellcode and map data (leave DLL in memory)
-    VirtualFreeEx(hProcess, pShellcode, 0, MEM_RELEASE);
-    VirtualFreeEx(hProcess, pMapData, 0, MEM_RELEASE);
-
-    // Set proper memory protections for sections
-    pSectionHeader = IMAGE_FIRST_SECTION(pNtHeaders);
-    for (WORD i = 0; i < pNtHeaders->FileHeader.NumberOfSections; ++i, ++pSectionHeader) {
-        DWORD protect = PAGE_READONLY;
-        DWORD characteristics = pSectionHeader->Characteristics;
-
-        if (characteristics & IMAGE_SCN_MEM_EXECUTE) {
-            if (characteristics & IMAGE_SCN_MEM_WRITE)
-                protect = PAGE_EXECUTE_READWRITE;
-            else if (characteristics & IMAGE_SCN_MEM_READ)
-                protect = PAGE_EXECUTE_READ;
-            else
-                protect = PAGE_EXECUTE;
-        }
-        else if (characteristics & IMAGE_SCN_MEM_WRITE) {
-            protect = PAGE_READWRITE;
-        }
-        else if (characteristics & IMAGE_SCN_MEM_READ) {
-            protect = PAGE_READONLY;
-        }
-
-        DWORD oldProtect;
-        VirtualProtectEx(hProcess, reinterpret_cast<BYTE*>(pTargetBase) + pSectionHeader->VirtualAddress,
-            pSectionHeader->Misc.VirtualSize, protect, &oldProtect);
-    }
-
+    outPath = dllPath;
     return true;
 }
 
+// Global path to extracted DLL
+std::wstring g_extractedDllPath;
+
+// Load GH Injector Library
+bool LoadGHInjector() {
+    if (!ExtractEmbeddedDll(g_extractedDllPath)) {
+        PrintErr("Failed to extract injector DLL");
+        return false;
+    }
+    
+    SetCurrentDirectoryW(NECROMANCER_DIR);
+    
+    g_hInjectorDll = LoadLibraryW(g_extractedDllPath.c_str());
+    if (!g_hInjectorDll) {
+        PrintErr("Failed to load injector DLL");
+        return false;
+    }
+    
+    g_pInjectW = reinterpret_cast<f_InjectW>(GetProcAddress(g_hInjectorDll, "InjectW"));
+    g_pGetSymbolState = reinterpret_cast<f_GetSymbolState>(GetProcAddress(g_hInjectorDll, "GetSymbolState"));
+    g_pGetImportState = reinterpret_cast<f_GetImportState>(GetProcAddress(g_hInjectorDll, "GetImportState"));
+    g_pStartDownload = reinterpret_cast<f_StartDownload>(GetProcAddress(g_hInjectorDll, "StartDownload"));
+    g_pGetDownloadProgressEx = reinterpret_cast<f_GetDownloadProgressEx>(GetProcAddress(g_hInjectorDll, "GetDownloadProgressEx"));
+    
+    if (!g_pInjectW) {
+        PrintErr("Failed to get inject function");
+        FreeLibrary(g_hInjectorDll);
+        g_hInjectorDll = nullptr;
+        return false;
+    }
+    
+    PrintOK("Injection engine ready");
+    return true;
+}
+
+// Unload GH Injector Library
+void UnloadGHInjector() {
+    if (g_hInjectorDll) {
+        FreeLibrary(g_hInjectorDll);
+        g_hInjectorDll = nullptr;
+    }
+}
+
+// Wait for GH Injector to be ready (symbols downloaded)
+bool WaitForGHInjectorReady() {
+    if (!g_pGetSymbolState || !g_pGetImportState) {
+        return true;
+    }
+    
+    PrintInfo("Initializing (first run may take a minute)...");
+    
+    if (g_pStartDownload) {
+        g_pStartDownload();
+    }
+    
+    int timeout = 300;
+    int elapsed = 0;
+    int lastProgress = -1;
+    
+    while (elapsed < timeout) {
+        DWORD symbolState = g_pGetSymbolState();
+        DWORD importState = g_pGetImportState();
+        
+        bool symbolDone = (symbolState != 0x1C && symbolState != 0x1D && symbolState != 0x1E);
+        bool importDone = (importState != 0x37);
+        
+        if (symbolDone && importDone) {
+            std::cout << "\r                                        \r";
+            PrintOK("Engine initialized");
+            return true;
+        }
+        
+        if (g_pGetDownloadProgressEx) {
+            float progress = g_pGetDownloadProgressEx(0, false);
+            int progressInt = static_cast<int>(progress * 100);
+            if (progressInt != lastProgress) {
+                PrintProgress(progressInt);
+                lastProgress = progressInt;
+            }
+        }
+        
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        elapsed++;
+    }
+    
+    std::cout << "\n";
+    return false;
+}
+
+
+// Inject using GH Injector Library
+bool InjectWithGHInjector(DWORD pid, const std::wstring& dllPath) {
+    if (!g_pInjectW) return false;
+    
+    INJECTIONDATAW injData = { 0 };
+    wcscpy_s(injData.szDllPath, dllPath.c_str());
+    injData.ProcessID = pid;
+    injData.Mode = INJECTION_MODE::IM_ManualMap;
+    injData.Method = LAUNCH_METHOD::LM_NtCreateThreadEx;
+    injData.Flags = 
+        INJ_MM_RESOLVE_IMPORTS |
+        INJ_MM_RESOLVE_DELAY_IMPORTS |
+        INJ_MM_INIT_SECURITY_COOKIE |
+        INJ_MM_EXECUTE_TLS |
+        INJ_MM_ENABLE_EXCEPTIONS |
+        INJ_MM_RUN_DLL_MAIN |
+        INJ_MM_SET_PAGE_PROTECTIONS |
+        INJ_THREAD_CREATE_CLOAKED;
+    injData.Timeout = 10000;
+    injData.GenerateErrorLog = true;
+    
+    DWORD result = g_pInjectW(&injData);
+    
+    if (result == 0) {
+        return true;
+    }
+    
+    std::string errMsg = "Error code: 0x";
+    char hexBuf[16];
+    sprintf_s(hexBuf, "%X", result);
+    errMsg += hexBuf;
+    PrintErr(errMsg.c_str());
+    return false;
+}
 
 void PrintBanner() {
+    system("cls");
+    
+    // Set console buffer and window size
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    COORD bufferSize = {145, 50};
+    SetConsoleScreenBufferSize(hConsole, bufferSize);
+    SMALL_RECT windowSize = {0, 0, 144, 35};
+    SetConsoleWindowInfo(hConsole, TRUE, &windowSize);
+    
+    std::cout << "\n";
     Color::Magenta();
-    std::cout << R"(
-    _   __                                                    
-   / | / /__  ____________  ____ ___  ____ _____  _________ 
-  /  |/ / _ \/ ___/ ___/ / / / __ `__ \/ __ `/ __ \/ ___/ _ \/ ___/
- / /|  /  __/ /__/ /  / /_/ / / / / / / /_/ / / / / /__/  __/ /    
-/_/ |_/\___/\___/_/   \____/_/ /_/ /_/\__,_/_/ /_/\___/\___/_/     
-                                                                   
-)" << "\n";
+    std::cout << "  `7FN.   `7MF'`7CM\"\"\"YMM    .g8\"\"\"bgd `7MM\"\"\"Mq.   .g8\"\"8q. `7MMM.     ,MMF'      db      `7MN.   `7MF' .g8\"\"\"bgd `7MM\"\"\"YMM  `7MM\"\"\"Mq.  \n";
+    std::cout << "    BMN.    L    IM    `7  .dP'     `M   MM   `MM..dP'    `YM. MMMb    dPAM       ;MM:       MMN.    M .HP'     `M   SM    `7    WM   `MM. \n";
     Color::Cyan();
-    std::cout << "                    [ Loader v1.0 ]\n\n";
+    std::cout << "    I YZb   Z    ZM   d    dE'       `   MM   ,M9 dM'      `MM M YM   ,M IM      ,V^MM.      M YMb   M dA'       `   IM   d      IM   ,M9  \n";
+    std::cout << "    Z  `MN. M    AMmmMM    MS            MMmmdM9  MM        MM M  Mb  M' MM     ,M  `MM      M  `MN. M MC            LMESPM      NESPdM9   \n";
+    Color::White();
+    std::cout << "    M   `MA.N    TM   Y  , MP.           MM  YM.  MM.      ,MP M  YM.P'  BM     AbmmmqMA     M   `MM.M MK.           EM   Y  ,   NM  YM.   \n";
+    std::cout << "    A     YMO    EM     ,M `Mb.     ,'   MM   `Mb.`Mb.    ,dP' M  `YM'   OM    A'     VML    M     YMM `Sb.     ,'   NM     ,M   EM   `Mb. \n";
+    Color::DarkGray();
+    std::cout << "  .JNL.    YT  .JRMhackMMM   `\"bmmmd'  .JMML. .JMM. `\"bmmd\"' .JML. `'  .JTML..AMA.   .AMMA..JML.    YM   `\"bmmmd'  .JTMmESPMMM .JRML. .JMM.\n";
+    std::cout << "\n";
+    
+    std::cout << "  =============================================================================================================\n";
+    Color::Cyan();
+    std::cout << "                                        ";
+    Color::White();
+    std::cout << "[ ";
+    Color::Magenta();
+    std::cout << "TF2 Loader";
+    Color::White();
+    std::cout << " | ";
+    Color::Cyan();
+    std::cout << "v2.1";
+    Color::White();
+    std::cout << " | ";
+    Color::Yellow();
+    std::cout << "by blizzman";
+    Color::White();
+    std::cout << " ]\n";
+    Color::DarkGray();
+    std::cout << "  =============================================================================================================\n\n";
     Color::White();
 }
 
 void WaitForProcess(const wchar_t* processName, const char* displayName) {
-    Color::Yellow();
-    std::cout << "[*] Waiting for " << displayName << "...\n";
-    Color::White();
+    std::string msg = "Waiting for ";
+    msg += displayName;
+    msg += "...";
+    PrintInfo(msg.c_str());
     
     while (!IsProcessRunning(processName)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
     
-    Color::Green();
-    std::cout << "[+] " << displayName << " detected!\n";
-    Color::White();
+    msg = displayName;
+    msg += " detected";
+    PrintOK(msg.c_str());
 }
 
 int main() {
-    SetConsoleTitleA("Necromancer Loader");
+    SetConsoleTitleA("Necromancer - TF2 Loader");
     
     PrintBanner();
+    
+    // Check for admin privileges
+    if (!IsRunningAsAdmin()) {
+        PrintErr("Administrator privileges required!");
+        PrintErr("Right-click and select 'Run as administrator'");
+        std::cout << "\n  Press any key to exit...";
+        std::cin.get();
+        return 1;
+    }
+    
+    PrintOK("Running as Administrator");
 
     // Check AVX2 support
     bool hasAVX2 = CheckAVX2Support();
-    Color::Cyan();
-    std::cout << "[*] CPU AVX2 Support: ";
-    if (hasAVX2) {
-        Color::Green();
-        std::cout << "YES\n";
-    }
-    else {
-        Color::Yellow();
-        std::cout << "NO\n";
-    }
-    Color::White();
+    std::string buildMsg = "Build: ";
+    buildMsg += hasAVX2 ? "AVX2 (optimized)" : "Standard";
+    PrintInfo(buildMsg.c_str());
 
     const char* downloadUrl = hasAVX2 ? URL_AVX2 : URL_RELEASE;
-    Color::Cyan();
-    std::cout << "[*] Using " << (hasAVX2 ? "AVX2" : "Standard") << " build\n\n";
-    Color::White();
+
+    // Load GH Injector Library
+    PrintInfo("Loading injection engine...");
+    if (!LoadGHInjector()) {
+        std::cout << "\n  Press any key to exit...";
+        std::cin.get();
+        return 1;
+    }
 
     // Check for Steam
     if (!IsProcessRunning(L"steam.exe")) {
-        Color::Yellow();
-        std::cout << "[!] Steam is not running!\n";
-        std::cout << "[*] Please start Steam first.\n";
-        Color::White();
         WaitForProcess(L"steam.exe", "Steam");
-        std::cout << "\n";
-    }
-    else {
-        Color::Green();
-        std::cout << "[+] Steam is running\n";
-        Color::White();
+    } else {
+        PrintOK("Steam running");
     }
 
     // Check for TF2
     if (!IsProcessRunning(L"tf_win64.exe")) {
-        Color::Yellow();
-        std::cout << "[!] Team Fortress 2 is not running!\n";
-        std::cout << "[*] Please start TF2 and wait until you're in the main menu.\n";
-        Color::White();
         WaitForProcess(L"tf_win64.exe", "Team Fortress 2");
-    }
-    else {
-        Color::Green();
-        std::cout << "[+] Team Fortress 2 is running\n";
-        Color::White();
+    } else {
+        PrintOK("TF2 running");
     }
 
-    // Wait for TF2 to be open for at least 25 seconds
+    // Wait for TF2 to initialize
     DWORD tf2Pid = GetProcessId(L"tf_win64.exe");
     int uptime = GetProcessUptime(tf2Pid);
     if (uptime >= 0 && uptime < 25) {
         int waitTime = 25 - uptime;
-        Color::Cyan();
-        std::cout << "[*] TF2 has been running for " << uptime << " seconds\n";
-        std::cout << "[*] Waiting " << waitTime << " more seconds for game to initialize...\n";
-        Color::White();
+        std::string waitMsg = "Waiting ";
+        waitMsg += std::to_string(waitTime);
+        waitMsg += "s for game init...";
+        PrintInfo(waitMsg.c_str());
         std::this_thread::sleep_for(std::chrono::seconds(waitTime));
     }
 
-    std::cout << "\n";
+    // Wait for GH Injector to be ready
+    if (!WaitForGHInjectorReady()) {
+        PrintErr("Injection engine failed to initialize!");
+        UnloadGHInjector();
+        std::cout << "\n  Press any key to exit...";
+        std::cin.get();
+        return 1;
+    }
 
     // Download DLL
-    Color::Cyan();
-    std::cout << "[*] Downloading Necromancer...\n";
-    Color::White();
-
+    PrintInfo("Downloading latest build...");
     std::vector<BYTE> zipData = DownloadFile(downloadUrl);
     
     if (zipData.empty()) {
-        Color::Red();
-        std::cout << "\n[ERROR] Download failed!\n";
-        std::cout << "[ERROR] The DLL might be building right now. Try again later.\n\n";
-        Color::White();
-        std::cout << "Press any key to exit...";
+        PrintErr("Download failed! Try again later.");
+        UnloadGHInjector();
+        std::cout << "\n  Press any key to exit...";
         std::cin.get();
         return 1;
     }
-
-    Color::Green();
-    std::cout << "[+] Downloaded " << zipData.size() << " bytes\n";
-    Color::White();
+    PrintOK("Download complete");
 
     // Extract DLL from ZIP
-    Color::Cyan();
-    std::cout << "[*] Extracting DLL from archive...\n";
-    Color::White();
-
+    PrintInfo("Extracting...");
     std::vector<BYTE> dllData = ExtractDllFromZip(zipData);
     
     if (dllData.empty()) {
-        Color::Red();
-        std::cout << "\n[ERROR] Failed to extract DLL from archive!\n";
-        std::cout << "[ERROR] The archive might be corrupted or building. Try again later.\n\n";
-        Color::White();
-        std::cout << "Press any key to exit...";
+        PrintErr("Extraction failed!");
+        UnloadGHInjector();
+        std::cout << "\n  Press any key to exit...";
         std::cin.get();
         return 1;
     }
 
-    Color::Green();
-    std::cout << "[+] Extracted DLL: " << dllData.size() << " bytes\n\n";
-    Color::White();
+    // Save DLL
+    std::wstring dllPath;
+    if (!SaveDllToTemp(dllData, dllPath)) {
+        PrintErr("Failed to prepare DLL!");
+        UnloadGHInjector();
+        std::cout << "\n  Press any key to exit...";
+        std::cin.get();
+        return 1;
+    }
 
     // Get TF2 process
     DWORD pid = GetProcessId(L"tf_win64.exe");
     if (pid == 0) {
-        Color::Red();
-        std::cout << "[ERROR] Team Fortress 2 is no longer running!\n\n";
-        Color::White();
-        std::cout << "Press any key to exit...";
+        PrintErr("TF2 is no longer running!");
+        UnloadGHInjector();
+        std::cout << "\n  Press any key to exit...";
         std::cin.get();
         return 1;
     }
 
-    Color::Cyan();
-    std::cout << "[*] TF2 Process ID: " << pid << "\n";
-    Color::White();
+    std::string injectMsg = "Injecting (PID: ";
+    injectMsg += std::to_string(pid);
+    injectMsg += ")...";
+    PrintInfo(injectMsg.c_str());
 
-    // Open process
-    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-    if (!hProcess) {
-        Color::Red();
-        std::cout << "[ERROR] Failed to open TF2 process!\n";
-        std::cout << "[ERROR] Try running as Administrator.\n\n";
-        Color::White();
-        std::cout << "Press any key to exit...";
-        std::cin.get();
-        return 1;
-    }
-
-    Color::Green();
-    std::cout << "[+] Process opened successfully\n\n";
-    Color::White();
-
-    // Inject
-    Color::Cyan();
-    std::cout << "[*] Starting manual map injection...\n";
-    Color::White();
-
-    if (ManualMap(hProcess, dllData)) {
+    // Inject using GH Injector
+    if (InjectWithGHInjector(pid, dllPath)) {
+        std::cout << "\n";
+        Color::DarkGray();
+        std::cout << "    =========================================================\n";
         Color::Green();
-        std::cout << "\n[+] Injection successful!\n";
-        std::cout << "[+] Necromancer has been loaded.\n\n";
+        std::cout << "                    INJECTION SUCCESSFUL!\n";
+        Color::DarkGray();
+        std::cout << "    =========================================================\n\n";
         Color::White();
-        CloseHandle(hProcess);
         
-        std::cout << "Closing in 5 seconds...";
+        std::error_code ec;
+        std::filesystem::remove(dllPath, ec);
+        UnloadGHInjector();
+        
+        PrintInfo("Closing in 5 seconds...");
         std::this_thread::sleep_for(std::chrono::seconds(5));
         return 0;
     }
     else {
-        Color::Red();
-        std::cout << "\n[ERROR] Injection failed!\n\n";
-        Color::White();
+        PrintErr("Injection failed! Check GH_Inj_Log.txt");
     }
 
-    CloseHandle(hProcess);
+    std::error_code ec;
+    std::filesystem::remove(dllPath, ec);
+    UnloadGHInjector();
 
-    std::cout << "Press any key to exit...";
+    std::cout << "\n  Press any key to exit...";
     std::cin.get();
-    return 0;
+    return 1;
 }

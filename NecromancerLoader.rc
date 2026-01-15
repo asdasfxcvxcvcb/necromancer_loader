@@ -1,0 +1,7 @@
+#include "resource.h"
+
+// Application icon
+IDI_ICON1 ICON "necromancer.ico"
+
+// Embed the GH Injector DLL as a binary resource
+IDR_GH_INJECTOR_DLL RCDATA "bin\\Release\\GH Injector - x64.dll"

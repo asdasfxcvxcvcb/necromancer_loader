@@ -1,9 +1,13 @@
-
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "NecromancerLoader", "NecromancerLoader.vcxproj", "{A7C9F8B1-4D5E-4F3A-9B2C-1E8D7F6A5C3B}"
+	ProjectSection(ProjectDependencies) = postProject
+		{AC732425-E265-40FF-842F-C59CECE9A96C} = {AC732425-E265-40FF-842F-C59CECE9A96C}
+	EndProjectSection
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "GH Injector Library", "GH Injector Library\GH Injector Library.vcxproj", "{AC732425-E265-40FF-842F-C59CECE9A96C}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -15,6 +19,10 @@ Global
 		{A7C9F8B1-4D5E-4F3A-9B2C-1E8D7F6A5C3B}.Debug|x64.Build.0 = Debug|x64
 		{A7C9F8B1-4D5E-4F3A-9B2C-1E8D7F6A5C3B}.Release|x64.ActiveCfg = Release|x64
 		{A7C9F8B1-4D5E-4F3A-9B2C-1E8D7F6A5C3B}.Release|x64.Build.0 = Release|x64
+		{AC732425-E265-40FF-842F-C59CECE9A96C}.Debug|x64.ActiveCfg = Debug|x64
+		{AC732425-E265-40FF-842F-C59CECE9A96C}.Debug|x64.Build.0 = Debug|x64
+		{AC732425-E265-40FF-842F-C59CECE9A96C}.Release|x64.ActiveCfg = Release|x64
+		{AC732425-E265-40FF-842F-C59CECE9A96C}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
